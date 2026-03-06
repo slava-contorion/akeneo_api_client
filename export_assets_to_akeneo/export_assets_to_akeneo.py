@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 
 ASSET_FAMILY_CODE = "product_images"
 MAIN_ATTRIBUTE = "product_image_main"
-OTHER_ATTRIBUTE = "product_images"
+OTHER_ATTRIBUTE = "product_image_normal"
 DEFAULT_LABEL_LOCALE = "de_DE"
 
 
@@ -74,7 +74,7 @@ def load_input_csv(path: str) -> List[Dict]:
     products = {}
     
     with open(path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter=';')
+        reader = csv.DictReader(f, delimiter=',')
         for row in reader:
             sku = row['sku']
             product_title = row['product_title']
@@ -339,6 +339,15 @@ def process_product(http: AkeneoHttp, product_entry: Dict, stats: Dict) -> None:
     for img in valid_images:
         filename = img["seo_filename"]
         asset_code = sanitize_asset_code(filename)
+
+        # Optimization: if source path starts with "akeneo/", assume asset exists and skip processing
+        gcs_path = img.get("gcs_path")
+        if gcs_path and gcs_path.startswith("akeneo/"):
+            logger.info(f"Asset path starts with akeneo/: {gcs_path}, assuming exists")
+            print(f"Skipping Asset {asset_code}: path indicates existing asset ({gcs_path})")
+            asset_codes_in_order.append(asset_code)
+            continue
+
         existing, search_err = find_asset_by_code(http, ASSET_FAMILY_CODE, asset_code)
         if existing:
             logger.info(f"Asset exists: {asset_code}")
