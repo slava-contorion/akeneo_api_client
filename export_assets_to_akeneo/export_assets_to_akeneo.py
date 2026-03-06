@@ -2,11 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os
-import warnings
 import sys
 import json
 import time
-import tempfile
 import mimetypes
 import re
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +25,8 @@ try:
 except ModuleNotFoundError:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     from akeneo_api_client.client import Client
+
+from csv_formats import CsvFormatHandler, detect_csv_format
 
 
 ASSET_FAMILY_CODE = "product_images"
@@ -66,58 +66,6 @@ class AkeneoHttp:
             return self.session.patch(url, data=json.dumps(json_data, separators=(',', ':')), headers=headers)
         return self.session.patch(url, headers=headers)
 
-
-def load_input_csv(path: str) -> List[Dict]:
-    """Load CSV data and group by SKU to create product entries with images"""
-    import csv
-    
-    products = {}
-    
-    with open(path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter=',')
-        for row in reader:
-            sku = row['sku']
-            product_title = row['product_title']
-            # New CSV format: prefer explicit original image path (GCS-relative), else web URL
-            original_image_path = row.get('original_image_path') or ''
-            # sanitize possible quoted values like """bosch/IMG...""" -> bosch/IMG...
-            original_image_path = original_image_path.strip().strip('"').strip("'")
-            image_url = row.get('image_web_url') or row.get('image_url') or ''
-            image_seo_filename = row.get('image_seo_filename') or ''
-            image_position = row.get('image_position') or ''
-            
-            # Initialize product if not seen before
-            if sku not in products:
-                products[sku] = {
-                    'sku': sku,
-                    'name': product_title,
-                    'images': []
-                }
-            
-            # Add image if it has data
-            if (original_image_path or image_url) and image_seo_filename and image_position:
-                img_entry = {
-                    'seo_filename': image_seo_filename,
-                    'position': int(image_position)
-                }
-                if original_image_path:
-                    img_entry['gcs_path'] = original_image_path
-                if image_url:
-                    img_entry['url'] = image_url
-                # Carry through merchant hint for simplified GCS path building
-                most_likely_merchant = (row.get('most_likely_merchant') or '').strip()
-                if most_likely_merchant:
-                    img_entry['most_likely_merchant'] = most_likely_merchant
-                products[sku]['images'].append(img_entry)
-    
-    # Convert to list and sort images by position
-    result = []
-    for sku, product in products.items():
-        # Sort images by position
-        product['images'].sort(key=lambda x: x.get('position', 9999))
-        result.append(product)
-    
-    return result
 
 
 def sanitize_asset_code(filename: str) -> str:
@@ -163,84 +111,9 @@ def find_asset_by_code(http: AkeneoHttp, family_code: str, asset_code: str) -> T
     return (items[0] if items else None), None
 
 
-def download_image(url: str, timeout: int = 20, retries: int = 2, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[bytes], Optional[str]]:
-    last_err = None
-    for _ in range(retries + 1):
-        try:
-            with requests.get(url, stream=True, timeout=timeout, allow_redirects=True, headers=headers) as resp:
-                if resp.status_code != 200:
-                    last_err = f"HTTP {resp.status_code} downloading image"
-                    continue
-                ct = (resp.headers.get('Content-Type') or '').lower()
-                if 'text/html' in ct or (ct and not ct.startswith('image/')):
-                    last_err = f"unexpected Content-Type: {ct}"
-                    continue
-                chunks = []
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        chunks.append(chunk)
-                data = b"".join(chunks)
-                if not data:
-                    last_err = "empty response body"
-                    continue
-                return data, None
-        except Exception as e:
-            last_err = str(e)
-    return None, last_err or "Unknown download error"
 
 
-def get_gcs_auth_headers() -> Dict[str, str]:
-    """Return Authorization header for Google Cloud Storage JSON API if ADC creds available."""
-    try:
-        # Optionally suppress noisy user-cred quota warnings if requested
-        if os.environ.get("SUPPRESS_GOOGLE_AUTH_USERWARNING") == "1":
-            warnings.filterwarnings("ignore", category=UserWarning, module="google.auth._default")
-        from google.auth import default as google_auth_default  # type: ignore
-        from google.auth.transport.requests import Request as GoogleAuthRequest  # type: ignore
-        quota_project_id = os.environ.get("GOOGLE_CLOUD_QUOTA_PROJECT") or os.environ.get("GCP_QUOTA_PROJECT")
-        # Provide quota project when using user ADC creds to prevent warnings and quota issues
-        try:
-            creds, _ = google_auth_default(
-                scopes=['https://www.googleapis.com/auth/devstorage.read_only'],
-                quota_project_id=quota_project_id,
-            )
-        except TypeError:
-            # Older google-auth versions don't support quota_project_id; fall back
-            creds, _ = google_auth_default(scopes=['https://www.googleapis.com/auth/devstorage.read_only'])
-        if not creds.valid:
-            creds.refresh(GoogleAuthRequest())
-        if creds.token:
-            return {"Authorization": f"Bearer {creds.token}"}
-    except Exception:
-        pass
-    return {}
 
-
-def build_single_gcs_url(original_image_path: str, most_likely_merchant: str) -> str:
-    """Build a single canonical GCS URL per simplified rules.
-
-    Unified rule:
-      https://storage.googleapis.com/<GCS_BUCKET_PATH>/<most_likely_merchant>/<original_image_path>
-
-    Notes:
-      - <GCS_BUCKET_PATH> comes from env GCS_BUCKET_PATH (e.g. "staging_image-service/source_images").
-      - We do not add/remove any "source_images" segments here.
-      - If original_image_path already starts with <most_likely_merchant>/, strip that prefix
-        to avoid duplication in the final URL.
-    """
-    bucket_path = os.environ.get('GCS_BUCKET_PATH') or 'staging_image-service/source_images'
-    base = f"https://storage.googleapis.com/{bucket_path.rstrip('/')}"
-    merchant = (most_likely_merchant or '').strip().strip('/')
-    key = (original_image_path or '').strip().strip('"').strip("'")
-    key = key.lstrip('/')
-    if merchant and key.startswith(merchant + '/'):
-        key = key[len(merchant) + 1:]
-    if merchant:
-        return f"{base}/{merchant}/{key}"
-    return f"{base}/{key}"
-
-
-    
 
 def upload_asset_media(http: AkeneoHttp, file_bytes: bytes, filename: str, source_uri: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     print(f"Uploading media from '{source_uri or filename}'")
@@ -299,7 +172,7 @@ def update_product_assets(http: AkeneoHttp, sku: str, main_code: Optional[str], 
     return None
 
 
-def process_product(http: AkeneoHttp, product_entry: Dict, stats: Dict) -> None:
+def process_product(http: AkeneoHttp, product_entry: Dict, stats: Dict, handler: CsvFormatHandler) -> None:
     sku = product_entry.get("sku")
     images = product_entry.get("images", []) or []
     if not sku:
@@ -340,11 +213,9 @@ def process_product(http: AkeneoHttp, product_entry: Dict, stats: Dict) -> None:
         filename = img["seo_filename"]
         asset_code = sanitize_asset_code(filename)
 
-        # Optimization: if source path starts with "akeneo/", assume asset exists and skip processing
-        gcs_path = img.get("gcs_path")
-        if gcs_path and gcs_path.startswith("akeneo/"):
-            logger.info(f"Asset path starts with akeneo/: {gcs_path}, assuming exists")
-            print(f"Skipping Asset {asset_code}: path indicates existing asset ({gcs_path})")
+        if handler.should_skip_download(img):
+            logger.info(f"Asset assumed to exist based on metadata: {asset_code}")
+            print(f"Skipping Asset {asset_code}: assumed to exist based on metadata")
             asset_codes_in_order.append(asset_code)
             continue
 
@@ -359,47 +230,21 @@ def process_product(http: AkeneoHttp, product_entry: Dict, stats: Dict) -> None:
             stats["other"].append((sku, search_err))
             print(f"Skipping Asset {asset_code}: search error: {search_err}")
             continue
-        # Need to create asset
-        file_bytes = None
-        dl_err = None
-        gcs_path = img.get("gcs_path")
-        src_gcs_used: Optional[str] = None
-        if gcs_path:
-            # Build single canonical GCS URL per simplified rules
-            merchant = img.get('most_likely_merchant') or ''
-            gcs_url = build_single_gcs_url(gcs_path, merchant)
-            gcs_headers = get_gcs_auth_headers()
-            fb, fe = download_image(gcs_url, headers=gcs_headers)
-            if fe is None and fb:
-                file_bytes, dl_err = fb, None
-                src_gcs_used = gcs_url
-            elif img.get("url"):
-                # Log single failure and fall back to web URL
-                logger.error(f"SKU {sku}: GCS HTTP download failed for {gcs_url}: {fe or 'unknown error'}")
-                print(f"GCS download failed for '{gcs_url}': {fe or 'unknown error'}")
-                try_bytes, try_err = download_image(img["url"])  # fallback to HTTP
-                if try_err is None and try_bytes:
-                    file_bytes, dl_err = try_bytes, None
-                    src_gcs_used = img.get('url')
-                    print(f"Falling back to HTTP for '{img.get('url')}'")
-        elif img.get("url"):
-            file_bytes, dl_err = download_image(img["url"])  # fallback to HTTP
-            if dl_err is None and file_bytes:
-                src_gcs_used = img.get('url')
+
+        file_bytes, dl_err, src_hint = handler.download_image_for_entry(img)
+        if not src_hint:
+            src_hint = filename
         if dl_err:
-            src_hint = src_gcs_used or img.get('gcs_path') or img.get('url') or filename
             logger.error(f"SKU {sku}: download error for {src_hint}: {dl_err}")
             stats["other"].append((sku, f"download error: {dl_err}"))
             print(f"Skipping Asset {asset_code}: download error: {dl_err}")
             continue
-        # Ensure we have non-empty bytes; Akeneo will reject empty file with 422
         if not file_bytes:
-            src_hint = src_gcs_used or img.get('gcs_path') or img.get('url') or filename
             logger.error(f"SKU {sku}: downloaded empty payload for {src_hint}")
             stats["other"].append((sku, "downloaded empty payload"))
             print(f"Skipping Asset {asset_code}: empty payload")
             continue
-        src_hint = src_gcs_used or gcs_path or img.get("url") or filename
+
         media_file_code, upload_err = upload_asset_media(http, file_bytes, filename, source_uri=src_hint)
         if upload_err:
             logger.error(f"SKU {sku}: media upload error: {upload_err}")
@@ -485,7 +330,8 @@ def main():
     http = AkeneoHttp(akeneo, AKENEO_BASE_URL)
 
     try:
-        products = load_input_csv(input_path)
+        handler = detect_csv_format(input_path)
+        products = handler.load_csv(input_path)
     except Exception as e:
         print(f"Failed to load input file {input_path}: {e}")
         sys.exit(2)
@@ -493,7 +339,7 @@ def main():
     stats = {"total": len(products), "updated": [], "not_found": [], "ambiguous": [], "other": []}
     for entry in products:
         try:
-            process_product(http, entry, stats)
+            process_product(http, entry, stats, handler)
         except Exception as e:
             sku = entry.get('sku') if isinstance(entry, dict) else None
             logger.exception("Unhandled error")

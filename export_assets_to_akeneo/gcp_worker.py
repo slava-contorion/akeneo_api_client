@@ -69,15 +69,16 @@ def process_single_file(bucket_name, file_name):
         print(f"Downloading {file_name} to {temp_local_filename}")
         blob.download_to_filename(temp_local_filename)
         
-        # 3. Process
-        products = exporter.load_input_csv(temp_local_filename)
+        # 3. Detect format & process
+        handler = exporter.detect_csv_format(temp_local_filename)
+        products = handler.load_csv(temp_local_filename)
         print(f"Loaded {len(products)} products from CSV")
         
         stats = {"total": len(products), "updated": [], "not_found": [], "ambiguous": [], "other": []}
         
         for entry in products:
             try:
-                exporter.process_product(http, entry, stats)
+                exporter.process_product(http, entry, stats, handler)
             except Exception as e:
                 sku = entry.get('sku')
                 print(f"Unhandled error processing SKU {sku}: {e}")
